@@ -1,4 +1,5 @@
 import { useState } from "react";
+import mammoth from "mammoth";
 
 // ─────────────────────────────────────────────────────────────
 // OLYVECO BRAND KIT — locked in
@@ -420,24 +421,255 @@ function buildExportHtml(doc, seriesLabel) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Shared generation + file reading helpers
+// ─────────────────────────────────────────────────────────────
+const MAX_OUTPUT_TOKENS = 4000;
+
+async function generateDocument(userPrompt) {
+  const response = await fetch("/api/generate", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: MAX_OUTPUT_TOKENS,
+      system: VOICE_SYSTEM_PROMPT,
+      messages: [{ role: "user", content: userPrompt }],
+    }),
+  });
+  const data = await response.json();
+  const text = (data.content || [])
+    .filter((b) => b.type === "text")
+    .map((b) => b.text)
+    .join("\n");
+  // Tolerate stray prose or fences around the JSON
+  const clean = text.replace(/```json|```/g, "").trim();
+  const start = clean.indexOf("{");
+  const end = clean.lastIndexOf("}");
+  if (start === -1 || end === -1) throw new Error("no JSON in response");
+  return JSON.parse(clean.slice(start, end + 1));
+}
+
+let pdfjsPromise = null;
+function loadPdfJs() {
+  if (typeof window !== "undefined" && window.pdfjsLib) return Promise.resolve(window.pdfjsLib);
+  if (!pdfjsPromise) {
+    pdfjsPromise = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js";
+      s.onload = () => {
+        try {
+          window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+            "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+          resolve(window.pdfjsLib);
+        } catch (e) {
+          reject(e);
+        }
+      };
+      s.onerror = () => reject(new Error("PDF reader failed to load"));
+      document.head.appendChild(s);
+    });
+  }
+  return pdfjsPromise;
+}
+
+async function extractPdfText(file) {
+  const pdfjs = await loadPdfJs();
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjs.getDocument({ data: buf }).promise;
+  let text = "";
+  const maxPages = Math.min(pdf.numPages, 40); // plenty for any guide or ebook chapter
+  for (let p = 1; p <= maxPages; p++) {
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+    text += content.items.map((it) => it.str).join(" ") + "\n\n";
+  }
+  return text;
+}
+
+async function extractFileText(file) {
+  const name = file.name.toLowerCase();
+  if (name.endsWith(".pdf")) {
+    return await extractPdfText(file);
+  }
+  if (name.endsWith(".docx")) {
+    const buf = await file.arrayBuffer();
+    const result = await mammoth.extractRawText({ arrayBuffer: buf });
+    return result.value;
+  }
+  // .txt, .md, .html and other text-based files
+  return await file.text();
+}
+
+let html2pdfPromise = null;
+function loadHtml2Pdf() {
+  if (typeof window !== "undefined" && window.html2pdf) return Promise.resolve(window.html2pdf);
+  if (!html2pdfPromise) {
+    html2pdfPromise = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js";
+      s.onload = () => resolve(window.html2pdf);
+      s.onerror = () => reject(new Error("PDF engine failed to load"));
+      document.head.appendChild(s);
+    });
+  }
+  return html2pdfPromise;
+}
+
+async function triggerPdfDownload(d, seriesLabel) {
+  const html2pdf = await loadHtml2Pdf();
+  // Render the export layout into a hidden container sized like a letter page
+  const holder = document.createElement("div");
+  holder.style.position = "fixed";
+  holder.style.left = "-10000px";
+  holder.style.top = "0";
+  holder.style.width = "612pt";
+  holder.style.background = "#fff";
+  const full = buildExportHtml(d, seriesLabel);
+  const bodyInner = full.slice(full.indexOf("<body"), full.indexOf("</body>"));
+  holder.innerHTML =
+    `<div style="font-family:Georgia,serif;color:#2B2B26;padding:0;">` +
+    bodyInner.slice(bodyInner.indexOf(">") + 1) +
+    `</div>`;
+  document.body.appendChild(holder);
+  try {
+    await html2pdf()
+      .set({
+        margin: [36, 44, 40, 44],
+        filename: `${(d.title || "Olyveco Document").replace(/[^a-z0-9]+/gi, "_")}.pdf`,
+        image: { type: "jpeg", quality: 0.96 },
+        html2canvas: { scale: 2, useCORS: true, backgroundColor: "#ffffff" },
+        jsPDF: { unit: "pt", format: "letter", orientation: "portrait" },
+        pagebreak: { mode: ["css", "legacy"] },
+      })
+      .from(holder)
+      .save();
+  } finally {
+    document.body.removeChild(holder);
+  }
+}
+
+function triggerWordDownload(d, seriesLabel) {
+  const fullHtml = buildExportHtml(d, seriesLabel);
+  const blob = new Blob(["\ufeff", fullHtml], { type: "application/msword" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${(d.title || "Olyveco Document").replace(/[^a-z0-9]+/gi, "_")}.doc`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// ─────────────────────────────────────────────────────────────
 // Main app
 // ─────────────────────────────────────────────────────────────
 export default function OlyvecoStudio() {
   const [productType, setProductType] = useState("guide");
   const [title, setTitle] = useState("");
   const [audience, setAudience] = useState("Homeowners facing the Stay vs. Go decision");
-  const [series, setSeries] = useState(STAY_OR_GO_WELCOME.series);
+  const [series, setSeries] = useState("Homeowner Education Series");
   const [notes, setNotes] = useState("");
   const [editorNotes, setEditorNotes] = useState("");
-  const [doc, setDoc] = useState(STAY_OR_GO_WELCOME);
+  const [doc, setDoc] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [copied, setCopied] = useState(false);
+  const [batchQueue, setBatchQueue] = useState([]);
+  const [batchRunning, setBatchRunning] = useState(false);
 
   const loadFromLibrary = (item) => {
     setDoc(item);
     setSeries(item.series || "Homeowner Education Series");
     setError("");
+  };
+
+  const handleBatchFiles = (e) => {
+    const files = Array.from(e.target.files || []);
+    if (!files.length) return;
+    setBatchQueue(
+      files.map((f) => ({ file: f, name: f.name, status: "queued", doc: null }))
+    );
+    setError("");
+    e.target.value = "";
+  };
+
+  const runBatch = async () => {
+    setBatchRunning(true);
+    setError("");
+    const typeLabel = PRODUCT_TYPES.find((t) => t.id === productType)?.label || "Education Guide";
+    const queue = [...batchQueue];
+    for (let i = 0; i < queue.length; i++) {
+      if (queue[i].status === "done") continue;
+      queue[i] = { ...queue[i], status: "processing" };
+      setBatchQueue([...queue]);
+      try {
+        const raw = await extractFileText(queue[i].file);
+        if (!raw || raw.trim().length < 40)
+          throw new Error("no readable text (scanned or image-only file?)");
+        const userPrompt = [
+          `PRODUCT TYPE: ${typeLabel}`,
+          `AUDIENCE: ${audience || "Homeowners"}`,
+          `TITLE: propose one based on the content (or keep the original document's title if it has one)`,
+          editorNotes.trim() ? `EDITOR NOTES: ${editorNotes}` : "",
+          "",
+          "RAW CONTENT / NOTES:",
+          raw.slice(0, 12000),
+        ]
+          .filter(Boolean)
+          .join("\n");
+        const parsed = await generateDocument(userPrompt);
+        queue[i] = { ...queue[i], status: "done", doc: parsed };
+      } catch (err) {
+        console.error("Batch item failed:", queue[i].name, err);
+        queue[i] = { ...queue[i], status: "error" };
+      }
+      setBatchQueue([...queue]);
+    }
+    setBatchRunning(false);
+  };
+
+  const downloadAllResults = async () => {
+    setError("");
+    const done = batchQueue.filter((q) => q.status === "done" && q.doc);
+    for (const item of done) {
+      triggerWordDownload(item.doc, series);
+      // small gap so the browser accepts each download
+      await new Promise((r) => setTimeout(r, 700));
+    }
+  };
+
+  const [pdfBusy, setPdfBusy] = useState(false);
+
+  const downloadPdf = async () => {
+    if (!doc) return;
+    setError("");
+    setPdfBusy(true);
+    try {
+      await triggerPdfDownload(doc, series);
+    } catch (err) {
+      console.error("PDF error:", err);
+      setError("PDF download failed — you can still use Print / Save PDF as a backup.");
+    } finally {
+      setPdfBusy(false);
+    }
+  };
+
+  const downloadAllResultsPdf = async () => {
+    setError("");
+    setPdfBusy(true);
+    try {
+      const done = batchQueue.filter((q) => q.status === "done" && q.doc);
+      for (const item of done) {
+        await triggerPdfDownload(item.doc, series);
+        await new Promise((r) => setTimeout(r, 500));
+      }
+    } catch (err) {
+      console.error("Batch PDF error:", err);
+      setError("PDF download stopped partway — try Download all again; finished files are already saved.");
+    } finally {
+      setPdfBusy(false);
+    }
   };
 
   const generate = async () => {
@@ -461,28 +693,11 @@ export default function OlyvecoStudio() {
         .filter(Boolean)
         .join("\n");
 
-      const response = await fetch("/api/generate", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          model: "claude-sonnet-4-6",
-          max_tokens: 1000,
-          system: VOICE_SYSTEM_PROMPT,
-          messages: [{ role: "user", content: userPrompt }],
-        }),
-      });
-
-      const data = await response.json();
-      const text = (data.content || [])
-        .filter((b) => b.type === "text")
-        .map((b) => b.text)
-        .join("\n");
-      const clean = text.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(clean);
+      const parsed = await generateDocument(userPrompt);
       setDoc(parsed);
     } catch (err) {
       console.error("Generation error:", err);
-      setError("Something went wrong assembling the document. Try again, or shorten your notes slightly.");
+      setError("The editor couldn't finish that one. Try again — and if it repeats, split the content into two shorter runs.");
     } finally {
       setLoading(false);
     }
@@ -544,18 +759,7 @@ export default function OlyvecoStudio() {
     if (!doc) return;
     setError("");
     try {
-      // Word-safe HTML (built from the document data, not the on-screen layout)
-      // so bullets keep their hanging indent in Word, Google Docs, and Pages.
-      const fullHtml = buildExportHtml(doc, series);
-      const blob = new Blob(["\ufeff", fullHtml], { type: "application/msword" });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${(doc.title || "Olyveco Document").replace(/[^a-z0-9]+/gi, "_")}.doc`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      URL.revokeObjectURL(url);
+      triggerWordDownload(doc, series);
     } catch {
       setError("Download didn't start — use Print / Save PDF or Copy for Skool instead.");
     }
@@ -749,10 +953,17 @@ export default function OlyvecoStudio() {
               Download document (Word)
             </button>
             <button
+              onClick={downloadPdf}
+              disabled={pdfBusy}
+              style={{ flex: "1 1 100%", fontFamily: BRAND.sans, fontSize: 13, padding: "10px", borderRadius: 7, border: "none", background: pdfBusy ? BRAND.muted : BRAND.forest, color: "#fff", cursor: pdfBusy ? "wait" : "pointer", fontWeight: 600 }}
+            >
+              {pdfBusy ? "Preparing PDF…" : "Download document (PDF)"}
+            </button>
+            <button
               onClick={printDoc}
               style={{ flex: 1, fontFamily: BRAND.sans, fontSize: 13, padding: "10px", borderRadius: 7, border: `1px solid ${BRAND.forest}`, background: "#fff", color: BRAND.forest, cursor: "pointer", fontWeight: 600 }}
             >
-              Print / Save PDF
+              Print
             </button>
             <button
               onClick={copyMarkdown}
@@ -762,6 +973,121 @@ export default function OlyvecoStudio() {
             </button>
           </div>
         )}
+
+        {/* ── Batch rebrand ── */}
+        <div style={{ marginTop: 24, paddingTop: 18, borderTop: `1px solid ${BRAND.oliveLine}` }}>
+          <span style={chrome.label}>Batch rebrand — do many at once</span>
+          <p style={{ fontFamily: BRAND.sans, fontSize: 11.5, color: BRAND.muted, margin: "0 0 8px", lineHeight: 1.5 }}>
+            Select several files (.pdf, .docx, .txt, .md, .html) and the studio reads each one,
+            rewrites it in the Olyveco voice, and lays it into the template — using the product
+            type and settings above. Note: scanned/image-only PDFs can't be read.
+          </p>
+          <input
+            type="file"
+            multiple
+            accept=".pdf,.docx,.txt,.md,.html"
+            onChange={handleBatchFiles}
+            disabled={batchRunning}
+            style={{ ...chrome.input, padding: "8px" }}
+          />
+          {batchQueue.length > 0 && (
+            <div style={{ marginTop: 10 }}>
+              {batchQueue.map((item, i) => (
+                <div
+                  key={i}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    fontFamily: BRAND.sans,
+                    fontSize: 12,
+                    padding: "6px 8px",
+                    borderRadius: 5,
+                    background: item.status === "processing" ? BRAND.oliveSoft : "transparent",
+                    color: BRAND.ink,
+                  }}
+                >
+                  <span
+                    style={{
+                      width: 9,
+                      height: 9,
+                      borderRadius: "50%",
+                      flexShrink: 0,
+                      background:
+                        item.status === "done"
+                          ? BRAND.forest
+                          : item.status === "error"
+                          ? "#8A3B2E"
+                          : item.status === "processing"
+                          ? "#B99B45"
+                          : BRAND.oliveLine,
+                    }}
+                  />
+                  <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {item.name}
+                  </span>
+                  {item.status === "processing" && <span style={{ color: BRAND.muted }}>writing…</span>}
+                  {item.status === "error" && <span style={{ color: "#8A3B2E" }}>failed</span>}
+                  {item.status === "done" && (
+                    <>
+                      <button
+                        onClick={() => setDoc(item.doc)}
+                        style={{ fontFamily: BRAND.sans, fontSize: 11.5, padding: "3px 8px", borderRadius: 5, border: `1px solid ${BRAND.oliveLine}`, background: "#fff", color: BRAND.forest, cursor: "pointer" }}
+                      >
+                        View
+                      </button>
+                      <button
+                        onClick={() => triggerWordDownload(item.doc, series)}
+                        style={{ fontFamily: BRAND.sans, fontSize: 11.5, padding: "3px 8px", borderRadius: 5, border: `1px solid ${BRAND.oliveLine}`, background: "#fff", color: BRAND.forest, cursor: "pointer" }}
+                      >
+                        Download
+                      </button>
+                    </>
+                  )}
+                </div>
+              ))}
+              <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                <button
+                  onClick={runBatch}
+                  disabled={batchRunning || batchQueue.every((q) => q.status === "done")}
+                  style={{
+                    flex: 1,
+                    fontFamily: BRAND.sans,
+                    fontSize: 13,
+                    fontWeight: 600,
+                    padding: "10px",
+                    borderRadius: 7,
+                    border: "none",
+                    cursor: batchRunning ? "wait" : "pointer",
+                    background: batchRunning ? BRAND.muted : BRAND.forest,
+                    color: "#fff",
+                  }}
+                >
+                  {batchRunning
+                    ? `Rebranding… (${batchQueue.filter((q) => q.status === "done").length}/${batchQueue.length})`
+                    : `Rebrand ${batchQueue.length} document${batchQueue.length > 1 ? "s" : ""}`}
+                </button>
+                {batchQueue.some((q) => q.status === "done") && !batchRunning && (
+                  <>
+                    <button
+                      onClick={downloadAllResultsPdf}
+                      disabled={pdfBusy}
+                      style={{ flex: 1, fontFamily: BRAND.sans, fontSize: 13, fontWeight: 600, padding: "10px", borderRadius: 7, border: "none", background: pdfBusy ? BRAND.muted : BRAND.forestDark, color: "#fff", cursor: pdfBusy ? "wait" : "pointer" }}
+                    >
+                      {pdfBusy ? "Making PDFs…" : "Download all (PDF)"}
+                    </button>
+                    <button
+                      onClick={downloadAllResults}
+                      style={{ flex: 1, fontFamily: BRAND.sans, fontSize: 13, fontWeight: 600, padding: "10px", borderRadius: 7, border: `1px solid ${BRAND.forest}`, background: "#fff", color: BRAND.forest, cursor: "pointer" }}
+                    >
+                      Download all (Word)
+                    </button>
+                  </>
+                )}
+              </div>
+            </div>
+          )}
+        </div>
 
         <p style={{ fontFamily: BRAND.sans, fontSize: 11, color: BRAND.muted, marginTop: 18, lineHeight: 1.5 }}>
           Built-in library documents are always here. Newly generated documents live in this session only — print or copy anything you want to keep. "Copy for Skool" produces formatted markdown that pastes cleanly into your classroom.
